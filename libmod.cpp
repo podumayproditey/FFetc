@@ -1,11 +1,11 @@
 // libmod.so - авто-ремонт сломавшегося двигателя, Firefight 13.01 (arm64)
-// НЕ СОБИРАЛОСЬ и не тестировалось: каркас. Нужен Dobby (https://github.com/jmpews/Dobby).
+// НЕ тестировалось. Хуки: ShadowHook (Bytedance).
 #include <jni.h>
 #include <dlfcn.h>
 #include <android/log.h>
 #include <unordered_map>
 #include <mutex>
-#include "dobby.h"
+#include "shadowhook.h"
 
 #define TAG "libmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -104,7 +104,9 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM*, void*) {
     void* target = dlsym(h, "_ZN7Vehicle50considerIfVehicleBreaksDownOverTerrain_TimeElapsedEhf");
     if (!ok || !target) { LOGI("init failed"); return JNI_VERSION_1_6; }
 
-    DobbyHook(target, (void*)hook_breakdown, (void**)&orig_breakdown);
+    shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false);
+    void* stub = shadowhook_hook_func_addr(target, (void*)hook_breakdown, (void**)&orig_breakdown);
+    if (!stub) { LOGI("hook failed, errno=%d", shadowhook_get_errno()); return JNI_VERSION_1_6; }
     LOGI("hook installed");
     return JNI_VERSION_1_6;
 }
