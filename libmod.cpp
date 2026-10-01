@@ -6,6 +6,8 @@
 #include <unordered_map>
 #include <mutex>
 #include <cstdio>
+#include <cstring>
+#include <cstdint>
 #include "shadowhook.h"
 
 #define TAG "libmod"
@@ -50,7 +52,8 @@ static void*         g_game;          // Game*, перехватываем из 
 static SetBrew_t     setBrewUpTimer;
 static Breakdown_t   orig_breakdown;
 
-struct State { float repairLeft = -1; float grace = 0; bool seen = false; int lastImm = -1; int lastWhy = -1; };
+struct State { float repairLeft = -1; float grace = 0; bool seen = false; int lastImm = -1; int lastWhy = -1;
+               int fireIdx = -1; float fx = 0, fy = 0; };
 static std::unordered_map<void*, State> g_state;
 static std::mutex g_mu;
 
@@ -72,6 +75,49 @@ static void notifyRepaired(void* v) {
     char buf[96];
     snprintf(buf, sizeof buf, "Squad %d: vehicle repaired", (int)getSquadI(v) + 1);
     sendMsg(v, buf);
+}
+
+// ---- огонь от попадания в двигатель ----
+// Раскладка по дизассемблеру createFireAt / timerTickFiresAndSmokes (13.0.x):
+//   Game+0x1218 = FIRE*, Game+0x1214 = число слотов; sizeof(FIRE)=0x1c
+//   FIRE: +0 активен, +1 тип, +4 x, +8 y, +0xC таймер дыма, +0x10 размер дыма, +0x14 TTL (счёт вниз, <0 = вечный), +0x18 возраст
+static const size_t G_FIRES = 0x1218, G_FIRES_N = 0x1214, FIRE_SZ = 0x1c;
+static float rdf(const char* p, size_t off) { float f; memcpy(&f, p + off, 4); return f; }
+
+static void findFire(void* v, State& s) {   // ищем только что созданный огонь возле техники
+    if (!g_game) return;
+    char* base = (char*)g_game;
+    uint32_t n = *(uint32_t*)(base + G_FIRES_N);
+    char* arr = *(char**)(base + G_FIRES);
+    if (!arr || n == 0 || n > 100000) return;
+    POSITION vp = getPosition(v);
+    int best = -1; float bd = 1e30f;
+    for (uint32_t i = 0; i < n; i++) {
+        char* f = arr + i * FIRE_SZ;
+        if (f[0] != 1 || rdf(f, 0x18) > 1.5f) continue;     // только свежие (возраст < 1.5 c)
+        float dx = rdf(f, 4) - vp.x, dy = rdf(f, 8) - vp.y, d = dx * dx + dy * dy;
+        if (d < bd) { bd = d; best = (int)i; }
+    }
+    if (best >= 0) {
+        char* f = arr + best * FIRE_SZ;
+        s.fireIdx = best; s.fx = rdf(f, 4); s.fy = rdf(f, 8);
+        LOGI("fire slot %d found, dist2=%f", best, bd);
+    }
+}
+
+static void extinguishFire(State& s) {      // ставим TTL ~0: игра сама погасит огонь на следующем тике
+    if (s.fireIdx < 0 || !g_game) return;
+    char* base = (char*)g_game;
+    uint32_t n = *(uint32_t*)(base + G_FIRES_N);
+    char* arr = *(char**)(base + G_FIRES);
+    if (arr && (uint32_t)s.fireIdx < n) {
+        char* f = arr + (size_t)s.fireIdx * FIRE_SZ;
+        if (f[0] == 1 && rdf(f, 4) == s.fx && rdf(f, 8) == s.fy) {   // проверка, что слот не переиспользован
+            float ttl = 0.01f; memcpy(f + 0x14, &ttl, 4);
+            LOGI("fire slot %d extinguished", s.fireIdx);
+        }
+    }
+    s.fireIdx = -1;
 }
 
 static unsigned char hook_breakdown(void* v, unsigned char grid, float dt) {
@@ -111,11 +157,14 @@ static unsigned char hook_breakdown(void* v, unsigned char grid, float dt) {
     int why = getDisabledBecause(v);   // 1 = поломка на местности; 8 = попадание в двигатель / огонь
     bool broken = isImmobilized(v) != 0 && (why == 1 || (REPAIR_ENGINE_HIT && why == 8));
     if (alive && broken) {
-        if (s.repairLeft < 0) s.repairLeft = (why == 8) ? REPAIR_SECONDS_HIT : REPAIR_SECONDS;
+        if (s.repairLeft < 0) {
+            s.repairLeft = (why == 8) ? REPAIR_SECONDS_HIT : REPAIR_SECONDS;
+            if (why == 8) findFire(v, s);        // запоминаем огонь от попадания
+        }
         s.repairLeft -= dt;
         // TODO: проверять, что в экипаже есть живой (Man::getDisability), и что нет боя рядом
         if (s.repairLeft <= 0) {
-            if (why == 8) setBrewUpTimer(v, 0.0f);   // отменяем таймер взрыва
+            if (why == 8) { setBrewUpTimer(v, 0.0f); extinguishFire(s); }   // отменяем таймер взрыва и тушим огонь
             setImmobilized(v, 0);
             setDisabledBecause(v, 0);
             s.repairLeft = -1;
