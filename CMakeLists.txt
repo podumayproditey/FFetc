@@ -10,3 +10,8 @@ set_target_properties(shadowhook PROPERTIES
 
 add_library(mod SHARED libmod.cpp)
 target_link_libraries(mod shadowhook log dl)
+
+if(NOT DEFINED STAGE)
+  set(STAGE 3)
+endif()
+target_compile_definitions(mod PRIVATE STAGE=${STAGE})

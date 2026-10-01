@@ -1,4 +1,4 @@
-// libmod.so - авто-ремонт сломавшегося двигателя, Firefight 13.01 (arm64)
+// libmod.so - авто-ремонт сломавшегося двигателя, Firefight 13.0.2 (arm64)
 // НЕ тестировалось. Хуки: ShadowHook (Bytedance).
 #include <jni.h>
 #include <dlfcn.h>
@@ -91,7 +91,13 @@ template <class T> static bool sym(void* h, const char* n, T& out) {
     return out != nullptr;
 }
 
+#ifndef STAGE
+#define STAGE 3   // 1 = только загрузка, 2 = + init ShadowHook, 3 = полный хук
+#endif
+
 extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM*, void*) {
+    LOGI("JNI_OnLoad stage %d", STAGE);
+    if (STAGE <= 1) return JNI_VERSION_1_6;
     void* h = dlopen("libmain.so", RTLD_NOW | RTLD_NOLOAD);   // libmain уже загружена SDLActivity
     if (!h) { LOGI("libmain.so not loaded"); return JNI_VERSION_1_6; }
 
@@ -104,7 +110,9 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM*, void*) {
     void* target = dlsym(h, "_ZN7Vehicle50considerIfVehicleBreaksDownOverTerrain_TimeElapsedEhf");
     if (!ok || !target) { LOGI("init failed"); return JNI_VERSION_1_6; }
 
-    shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false);
+    int ir = shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false);
+    LOGI("shadowhook_init = %d", ir);
+    if (STAGE == 2) return JNI_VERSION_1_6;
     void* stub = shadowhook_hook_func_addr(target, (void*)hook_breakdown, (void**)&orig_breakdown);
     if (!stub) { LOGI("hook failed, errno=%d", shadowhook_get_errno()); return JNI_VERSION_1_6; }
     LOGI("hook installed");
