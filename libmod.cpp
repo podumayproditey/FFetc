@@ -34,8 +34,13 @@ static const float FUEL_FUSE_MIN       = 4.0f;  // после «зажигани
 static const float FUEL_FUSE_MAX       = 8.0f;
 // ---- боекомплект (БК): пробитие корпуса/башни может поджечь БК ----
 static const bool  AMMO_ENABLED         = true;
-static const float AMMO_IGNITE_CHANCE   = 0.12f; // шанс, что любое пробитие запустит горение БК
-static const float AMMO_INSTANT_CHANCE  = 0.04f; // шанс мгновенного подрыва БК сразу после пробития
+// (а) пробитие, после которого техника ЖИВА:
+static const float AMMO_IGNITE_CHANCE   = 0.20f; // шанс запустить горение БК
+static const float AMMO_INSTANT_CHANCE  = 0.06f; // шанс мгновенного подрыва БК
+// (б) техника УНИЧТОЖЕНА (любым способом) и в ней есть ВВ-боеприпасы — ваниль сама назначила бы взрыв,
+//     теперь решаем мы: сразу / после горения с искрами / вообще без взрыва (остаётся остов)
+static const float AMMO_KILL_INSTANT    = 0.25f; // взрыв сразу
+static const float AMMO_KILL_BURN       = 0.45f; // горит AMMO_BURN_MIN..MAX сек с искрами, потом взрыв (остаток шанса = без взрыва)
 static const float AMMO_BURN_MIN        = 10.0f; // горит до взрыва (сек), случайно в этом диапазоне
 static const float AMMO_BURN_MAX        = 60.0f; // максимум минута с начала возгорания
 static const float AMMO_SPARK_MIN       = 3.0f;  // редкие искры: интервал между ними (сек)
@@ -106,12 +111,16 @@ static SetDisabled_t setDisabledBecause;
 static Halt_t        haltCurrentOption;
 static Pen_t         orig_pen;
 static Destroy_t     destroyVehicle;
+using TickBrew_t = unsigned char (*)(void* v, float dt);
+static TickBrew_t    orig_tickbrew;
+static Destroy_t     orig_destroy;
+static bool          g_ownDestroy = false;   // true, пока destroyVehicle зовём мы сами (хук его не трогает)
 static HasBecome_t   hasBecomeDisabledBecause;
 static GetPtrEngine_t getPointerToEngine;
 static SteerType_t   getSteeringType;
 static NotPen_t      orig_notpen;
 static GetPos_t      getPosition;
-static GetU8_t       getSide, getSquadI, getI;
+static GetU8_t       getSide, getSquadI, getI, getKilledBySide, getKilledByI;
 static Radio_t       orig_radio;      // оригинал sendRadioMessage_..._Piece
 static void*         g_game;          // Game*, перехватываем из вызовов радио
 static SetBrew_t     setBrewUpTimer;
@@ -162,6 +171,10 @@ static void notifyRepaired(void* v) {
 //   FIRE: +0 активен, +1 тип, +4 x, +8 y, +0xC таймер дыма, +0x10 размер дыма, +0x14 TTL (счёт вниз, <0 = вечный), +0x18 возраст
 static const size_t G_FIRES = 0x1218, G_FIRES_N = 0x1214, FIRE_SZ = 0x1c;
 static float rdf(const char* p, size_t off) { float f; memcpy(&f, p + off, 4); return f; }
+// Vehicle+0x650 — оставшееся время до ванильного взрыва («brew up»); >0 только у уничтоженной техники с ВВ-боеприпасами
+static const size_t VEH_BREWUP = 0x650;
+static float& brewTimer(void* v) { return *(float*)((char*)v + VEH_BREWUP); }
+static std::unordered_map<void*, float> g_sparks;   // горящая уничтоженная техника → сек до следующей искры
 
 // Снимок «какие слоты огня сейчас активны». Берём ДО вызова, который создаёт огонь,
 // и сравниваем ПОСЛЕ: так находим именно новый огонь, без гаданий по возрасту/времени.
@@ -341,34 +354,83 @@ static void hook_pen(void* game, void* v, unsigned char ks, unsigned char ki, un
 }
 
 // ---- сам взрыв: мощность зависит от массы ----
-static void explodeVehicle(void* v, unsigned char ks, unsigned char ki, float lbMult, const char* why) {
-    if (!g_game || !destroyVehicle || getStatus(v) != 0) return;
+// Только эффекты (взрыв, ударная волна, искры, огонь): для уже уничтоженной техники.
+static void boomEffects(void* v, unsigned char ks, unsigned char ki, float lbMult, const char* why) {
+    if (!g_game) return;
     float kg = getMassKG ? getMassKG(v) : 0.0f;
     if (!(kg > 0.0f) || kg > 1e6f) kg = 20000.0f;          // защита от мусора
     float lb = kg * BOOM_LB_PER_KG * lbMult;
     if (lb < BOOM_LB_MIN) lb = BOOM_LB_MIN;
     if (lb > BOOM_LB_MAX * lbMult) lb = BOOM_LB_MAX * lbMult;
-
     POSITION p = getPosition(v);
-    // 1) уничтожение как раньше: экипаж эвакуируется/гибнет по ваниле
-    destroyVehicle(g_game, v, ks, ki, 40 /* vehicle explosion */, why);
-    // Ванильный взрыв: destroyVehicle ставит таймер «brew up» (Vehicle+0x650), по истечении которого
-    // Piece::timerTick отдаёт флаг, и серверный тик вызывает effectOfExplosionAt + createSparks.
-    // timerTickBrewUp при таймере <= 0 всегда возвращает 0, так что обнуляем его — ванильного взрыва не будет.
-    setBrewUpTimer(v, 0.0f);
-    // 2) визуальный взрыв, размер от массы
     if (createExplosionAt) createExplosionAt(g_game, p, BOOM_TYPE, 255 /* видят все */, lb);
-    // 3) ударная волна по соседям + звук (воронку не создаём)
-    if (effectOfExplosionAt)
+    if (effectOfExplosionAt)   // ударная волна по соседям + звук, воронку не создаём
         effectOfExplosionAt(g_game, VECTOR{p.x, p.y, 0.0f}, BOOM_TYPE, BOOM_SOUND, lb * 0.5f,
-                            false, ks, ki, 40, false /* без воронки */);
-    // 4) искры и догорающий остов (размер дыма тоже от массы)
+                            false, ks, ki, 40, false);
     if (createSparks) createSparks(g_game, v);
     if (createFireAt) createFireAt(g_game, p, 1.0f + lb / 100.0f, BOOM_FIRE_TYPE, BOOM_FIRE_TTL);
     LOGI("boom (%s) %p mass=%.0fkg lb=%.1f", why, v, kg, lb);
 }
 
+// Живую технику уничтожаем и взрываем.
+static void explodeVehicle(void* v, unsigned char ks, unsigned char ki, float lbMult, const char* why) {
+    if (!g_game || !destroyVehicle || getStatus(v) != 0) return;
+    g_ownDestroy = true;                                   // наш вызов: хук destroy его не обрабатывает
+    destroyVehicle(g_game, v, ks, ki, 40 /* vehicle explosion */, why);
+    g_ownDestroy = false;
+    // destroyVehicle ставит ванильный таймер взрыва (Vehicle+0x650) — обнуляем, взрываем сами
+    setBrewUpTimer(v, 0.0f);
+    boomEffects(v, ks, ki, lbMult, why);
+}
+
 static void explodeFuel(void* v, State& s) { explodeVehicle(v, s.fuelKS, s.fuelKI, 1.0f, "fuel tank"); }
+
+// Любое уничтожение техники (пробитие, взрыв рядом, арта...). Если ваниль назначила взрыв БК
+// (таймер >0, значит в технике есть ВВ-боеприпасы), решаем сами: сразу / с горением и искрами / без взрыва.
+static void hook_destroy(void* game, void* v, unsigned char ks, unsigned char ki, unsigned char method, const char* hitOn) {
+    g_game = game;
+    orig_destroy(game, v, ks, ki, method, hitOn);
+    if (g_ownDestroy || !AMMO_ENABLED || !v || getStatus(v) == 0) return;
+    if (!(brewTimer(v) > 0.0f)) return;                    // ванильного взрыва нет — не трогаем
+    float r = rand01();
+    if (r < AMMO_KILL_INSTANT) {
+        brewTimer(v) = 0.0f;
+        boomEffects(v, ks, ki, AMMO_BOOM_MULT, "ammunition");
+        LOGI("ammo: instant detonation of destroyed %p", v);
+    } else if (r < AMMO_KILL_INSTANT + AMMO_KILL_BURN) {
+        float t = AMMO_BURN_MIN + rand01() * (AMMO_BURN_MAX - AMMO_BURN_MIN);
+        brewTimer(v) = t;                                  // ваниль сама отсчитает, взрыв подменяет hook_tickbrew
+        std::lock_guard<std::recursive_mutex> lk(g_mu);
+        g_sparks[v] = AMMO_SPARK_MIN + rand01() * (AMMO_SPARK_MAX - AMMO_SPARK_MIN);
+        LOGI("ammo: destroyed %p burns for %.1fs", v, t);
+    } else {
+        brewTimer(v) = 0.0f;                               // повезло: БК не сдетонировал
+        LOGI("ammo: destroyed %p, no detonation", v);
+    }
+}
+
+// Тик таймера взрыва у уничтоженной техники: редкие искры, а по истечении — наш взрыв вместо ванильного.
+static unsigned char hook_tickbrew(void* v, float dt) {
+    bool burning = AMMO_ENABLED && v && brewTimer(v) > 0.0f;
+    unsigned char r = orig_tickbrew(v, dt);
+    if (!burning) return r;
+    if (r) {                                               // таймер истёк: ваниль взорвала бы сама
+        { std::lock_guard<std::recursive_mutex> lk(g_mu); g_sparks.erase(v); }
+        boomEffects(v, getKilledBySide ? getKilledBySide(v) : 0, getKilledByI ? getKilledByI(v) : 0,
+                    AMMO_BOOM_MULT, "ammunition");
+        return 0;                                          // ванильный взрыв подавлен
+    }
+    std::lock_guard<std::recursive_mutex> lk(g_mu);
+    auto it = g_sparks.find(v);
+    if (it != g_sparks.end()) {
+        it->second -= dt;
+        if (it->second <= 0) {
+            it->second = AMMO_SPARK_MIN + rand01() * (AMMO_SPARK_MAX - AMMO_SPARK_MIN);
+            if (createExplosionAt) createExplosionAt(g_game, getPosition(v), BOOM_TYPE, 255, AMMO_SPARK_LB);
+        }
+    }
+    return r;
+}
 
 static unsigned char hook_breakdown(void* v, unsigned char grid, float dt) {
     std::lock_guard<std::recursive_mutex> lk(g_mu);
@@ -512,6 +574,8 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM*, void*) {
            && sym(h, "_ZN5Piece7getSideEv", getSide)
            && sym(h, "_ZN5Piece9getSquadIEv", getSquadI)
            && sym(h, "_ZN5Piece4getIEv", getI)
+           && sym(h, "_ZN5Piece15getKilledBySideEv", getKilledBySide)
+           && sym(h, "_ZN5Piece12getKilledByIEv", getKilledByI)
            && sym(h, "_ZN7Vehicle24hasBecomeDisabledBecauseEh", hasBecomeDisabledBecause)
            && sym(h, "_ZN7Vehicle18getPointerToEngineEv", getPointerToEngine)
            && sym(h, "_ZN6Engine15getSteeringTypeEv", getSteeringType)
@@ -525,6 +589,8 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM*, void*) {
 
     void* penTarget = dlsym(h, "_ZN4Game180vehicleIsPenetrated_KillerSide_KillerI_ByMethod_Shot_IsHitOnTurret_IsHitOnSuperstructure_IsHitOnMantlet_IsHitOnFace_IsHitOnHighOrLow_IsHitOnFrontOrBack_OverPenetrationInMillimetresEP7VehiclehhhP4Shotbbbiiif");
     void* notPenTarget = dlsym(h, "_ZN4Game95radioThatVehicleIsHitButNotPenetrated_IsTurret_Structure_HighOrLow_Face_Mantlet_ByShot_ByMethodEP5PiecebiiibP4Shoth");
+    void* destroyTarget = dlsym(h, "_ZN4Game66destroyVehicleAndEvacuateCrewmen_KillerSide_KillerI_ByMethod_HitOnEP7VehiclehhhPKc");
+    void* tickBrewTarget = dlsym(h, "_ZN7Vehicle15timerTickBrewUpEf");
     void* radioTarget = dlsym(h, "_ZN4Game58sendRadioMessage_Urgency_ForSide_Position_Side_Squad_PieceEPKchh8POSITIONhhh");
     void* target = dlsym(h, "_ZN7Vehicle50considerIfVehicleBreaksDownOverTerrain_TimeElapsedEhf");
     if (!ok || !target) { LOGI("init failed"); return JNI_VERSION_1_6; }
@@ -540,6 +606,11 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM*, void*) {
         shadowhook_hook_func_addr(notPenTarget, (void*)hook_notpen, (void**)&orig_notpen);
     if (penTarget)
         shadowhook_hook_func_addr(penTarget, (void*)hook_pen, (void**)&orig_pen);
+    if (destroyTarget)
+        shadowhook_hook_func_addr(destroyTarget, (void*)hook_destroy, (void**)&orig_destroy);
+    if (tickBrewTarget && orig_destroy)       // подмена взрыва имеет смысл только вместе с хуком destroy
+        shadowhook_hook_func_addr(tickBrewTarget, (void*)hook_tickbrew, (void**)&orig_tickbrew);
+    LOGI("ammo hooks: destroy=%p tickbrew=%p", destroyTarget, tickBrewTarget);
     LOGI("hook installed, radio=%p notpen=%p pen=%p", radioTarget, notPenTarget, penTarget);
     return JNI_VERSION_1_6;
 }
