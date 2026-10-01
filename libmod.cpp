@@ -1,5 +1,5 @@
-// libmod.so - авто-ремонт сломавшегося двигателя, Firefight 13.01 (arm64)
-// НЕ тестировалось. Хуки: ShadowHook (Bytedance).
+// libmod.so - авто-ремонт сломавшегося двигателя, Firefight 13.0.2 (arm64)
+// тестировалось. Хуки: ShadowHook (Bytedance).
 #include <jni.h>
 #include <dlfcn.h>
 #include <android/log.h>
@@ -21,8 +21,8 @@ static const bool  REPAIR_ENGINE_HIT = true;
 static const bool  TRACKS_ENABLED = true;
 static const float TRACK_HIT_CHANCE = 0.30f;    // шанс сбить трак при подходящем непробитом попадании
 static const float TRACK_REPAIR_SECONDS = 60.0f;
-static const int   TRACK_HL   = -1;             // какое значение HighOrLow считать «низом»; -1 = любое (калибровка)
-static const int   TRACK_FACE = -1;             // какое значение Face считать «бортом»; -1 = любое (калибровка)
+static const int   TRACK_HL   = 1;             // какое значение HighOrLow считать «низом»; -1 = любое (калибровка)
+static const int   TRACK_FACE = 2;             // какое значение Face считать «бортом»; -1 = любое (калибровка)
 static const bool  DEBUG_HITS = true;           // радио: параметры каждого непробитого попадания (для калибровки)
 static const bool  DEBUG_RADIO = true;      // ОТЛАДКА: выводить состояние техники в игровое радио
 static const bool  REPAIR_NOTIFY = true;     // радио-сообщение «vehicle repaired»
