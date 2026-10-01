@@ -387,4 +387,26 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM*, void*) {
     sym(h, "_ZN4Game55createExplosionAt_Type_VisibleOnlyTo_PoundsOfExplosivesE8POSITIONhhf", createExplosionAt);
     sym(h, "_ZN4Game105effectOfExplosionAt_Type_Sound_PoundsOfExplosives_HitRoof_ShooterSide_ShooterI_DamagedByMethod_MakeCraterE6VECTORhPKcfbhhhb", effectOfExplosionAt);
     sym(h, "_ZN4Game32createSparksFromExplodingVehicleEP5Piece", createSparks);
-    sym(h, "_ZN4Game38c
+        sym(h, "_ZN4Game38createFireAt_SmokeSize_Type_TimeToLiveE8POSITIONfhf", createFireAt);
+
+    void* penTarget = dlsym(h, "_ZN4Game180vehicleIsPenetrated_KillerSide_KillerI_ByMethod_Shot_IsHitOnTurret_IsHitOnSuperstructure_IsHitOnMantlet_IsHitOnFace_IsHitOnHighOrLow_IsHitOnFrontOrBack_OverPenetrationInMillimetresEP7VehiclehhhP4Shotbbbiiif");
+    void* notPenTarget = dlsym(h, "_ZN4Game95radioThatVehicleIsHitButNotPenetrated_IsTurret_Structure_HighOrLow_Face_Mantlet_ByShot_ByMethodEP5PiecebiiibP4Shoth");
+    void* radioTarget = dlsym(h, "_ZN4Game58sendRadioMessage_Urgency_ForSide_Position_Side_Squad_PieceEPKchh8POSITIONhhh");
+    void* target = dlsym(h, "_ZN7Vehicle50considerIfVehicleBreaksDownOverTerrain_TimeElapsedEhf");
+    if (!ok || !target) { LOGI("init failed"); return JNI_VERSION_1_6; }
+
+    int ir = shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false);
+    LOGI("shadowhook_init = %d", ir);
+    if (STAGE == 2) return JNI_VERSION_1_6;
+    void* stub = shadowhook_hook_func_addr(target, (void*)hook_breakdown, (void**)&orig_breakdown);
+    if (!stub) { LOGI("hook failed, errno=%d", shadowhook_get_errno()); return JNI_VERSION_1_6; }
+    if (radioTarget)
+        shadowhook_hook_func_addr(radioTarget, (void*)hook_radio, (void**)&orig_radio);
+    if (notPenTarget)
+        shadowhook_hook_func_addr(notPenTarget, (void*)hook_notpen, (void**)&orig_notpen);
+    if (penTarget)
+        shadowhook_hook_func_addr(penTarget, (void*)hook_pen, (void**)&orig_pen);
+    LOGI("hook installed, radio=%p notpen=%p pen=%p", radioTarget, notPenTarget, penTarget);
+    return JNI_VERSION_1_6;
+}
+
