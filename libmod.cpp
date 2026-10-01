@@ -35,8 +35,8 @@ static const float BOOM_LB_PER_KG = 0.004f;     // 26 т -> ~104 lb, 60 т -> ~2
 static const float BOOM_LB_MIN    = 8.0f;
 static const float BOOM_LB_MAX    = 400.0f;
 static const float BOOM_FIRE_TTL  = 45.0f;      // сколько горит остов после взрыва
-static const unsigned char BOOM_TYPE = 1;       // КАЛИБРОВАТЬ: тип эффекта взрыва (createExplosionAt)
-static const unsigned char BOOM_FIRE_TYPE = 0;  // КАЛИБРОВАТЬ: тип огня (createFireAt)
+static const unsigned char BOOM_TYPE = 0;       // КАЛИБРОВАТЬ: тип эффекта взрыва (createExplosionAt)
+static const unsigned char BOOM_FIRE_TYPE = 1;  // КАЛИБРОВАТЬ: тип огня (createFireAt)
 static const char* BOOM_SOUND = "explode_tank"; // строка есть в libmain.so
 
 // ---- траки (своя механика: в игре её нет) ----
