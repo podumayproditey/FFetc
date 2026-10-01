@@ -14,19 +14,22 @@ jobs:
           mkdir -p sh
           cp -r shaar/prefab/modules/shadowhook/include sh/include
           cp shaar/prefab/modules/shadowhook/libs/android.arm64-v8a/libshadowhook.so sh/
-          ls -R sh | head -20
 
-      - name: Build arm64
+      - name: Build 3 stages
         run: |
           NDK="${ANDROID_NDK_HOME:-$ANDROID_NDK_LATEST_HOME}"
-          cmake -S . -B out \
-            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
-            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 \
-            -DANDROID_STL=c++_static -DCMAKE_BUILD_TYPE=Release
-          cmake --build out -j4 2>&1 | tee build.log
-          grep -m5 -B2 -A6 "error" build.log || true
-          test -f out/libmod.so
-          mkdir -p dist && cp out/libmod.so sh/libshadowhook.so dist/
+          mkdir -p dist
+          cp sh/libshadowhook.so dist/
+          for S in 1 2 3; do
+            cmake -S . -B out$S \
+              -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 \
+              -DANDROID_STL=c++_static -DCMAKE_BUILD_TYPE=Release -DSTAGE=$S
+            cmake --build out$S -j4 2>&1 | tee build$S.log
+            test -f out$S/libmod.so
+            mkdir -p dist/stage$S && cp out$S/libmod.so dist/stage$S/libmod.so
+          done
+          readelf -d dist/stage1/libmod.so | grep NEEDED
 
       - uses: actions/upload-artifact@v4
         with:
