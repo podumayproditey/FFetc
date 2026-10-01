@@ -1,5 +1,5 @@
 // libmod.so - авто-ремонт сломавшегося двигателя, Firefight 13.0.2 (arm64)
-// тестировалось. Хуки: ShadowHook (Bytedance).
+// Хуки: ShadowHook (Bytedance).
 #include <jni.h>
 #include <dlfcn.h>
 #include <android/log.h>
@@ -17,26 +17,41 @@
 static const float REPAIR_SECONDS = 45.0f;   // время ремонта
 static const float REPAIR_SECONDS_HIT = 90.0f; // ремонт после попадания в двигатель (причина 8)
 static const bool  REPAIR_ENGINE_HIT = true;
-// ---- траки (своя механика: в игре её нет) ----
+
 // ---- взрыв баков: пробитие двигателя с борта ----
 static const bool  FUEL_ENABLED = true;
-static const float FUEL_CHANCE = 0.35f;         // шанс взрыва баков при пробитии двигателя с борта
-static const float FUEL_DELAY_MIN = 2.0f;       // задержка до взрыва, секунды
-static const float FUEL_DELAY_MAX = 5.0f;
-static const int   FUEL_FACE_RIGHT = 3;  
-static const int   FUEL_FACE_LEFT = 2;// 2 = борт (по калибровке)
+static const int   FUEL_FACE_RIGHT = 3;
+static const int   FUEL_FACE_LEFT = 2;          // 2/3 = борт (по калибровке)
+// растущий шанс: каждая проверка +STEP, потолок MAX, пока двигатель не отремонтирован
+static const float FUEL_FIRST_CHECK    = 4.0f;  // сек после пробития до первой проверки
+static const float FUEL_CHECK_INTERVAL = 3.0f;  // как часто бросаем кубик
+static const float FUEL_CHANCE_START   = 0.03f; // шанс на первой проверке
+static const float FUEL_CHANCE_STEP    = 0.03f; // +3% за каждую проверку
+static const float FUEL_CHANCE_MAX     = 0.50f; // потолок шанса
+static const float FUEL_FUSE_MIN       = 4.0f;  // после «зажигания» горит до взрыва, сек
+static const float FUEL_FUSE_MAX       = 8.0f;
+// мощность взрыва от массы (фунты ВВ, линейно, с ограничением)
+static const float BOOM_LB_PER_KG = 0.004f;     // 26 т -> ~104 lb, 60 т -> ~240 lb
+static const float BOOM_LB_MIN    = 8.0f;
+static const float BOOM_LB_MAX    = 400.0f;
+static const float BOOM_FIRE_TTL  = 45.0f;      // сколько горит остов после взрыва
+static const unsigned char BOOM_TYPE = 1;       // КАЛИБРОВАТЬ: тип эффекта взрыва (createExplosionAt)
+static const unsigned char BOOM_FIRE_TYPE = 0;  // КАЛИБРОВАТЬ: тип огня (createFireAt)
+static const char* BOOM_SOUND = "explode_tank"; // строка есть в libmain.so
+
+// ---- траки (своя механика: в игре её нет) ----
 static const bool  TRACKS_ENABLED = true;
 static const float TRACK_HIT_CHANCE = 0.60f;    // шанс сбить трак при подходящем непробитом попадании
 static const float TRACK_REPAIR_SECONDS = 60.0f;
 static const int   TRACK_HL   = 1;              // какое значение HighOrLow считать «низом»; -1 = любое (калибровка)
-static const int   TRACK_FACE_RIGHT = 3;              // какое значение Face считать «бортом»; -1 = любое (калибровка)
+static const int   TRACK_FACE_RIGHT = 3;        // какое значение Face считать «бортом»; -1 = любое (калибровка)
 static const int   TRACK_FACE_LEFT = 2;
 static const bool  DEBUG_HITS = true;           // радио: параметры каждого непробитого попадания (для калибровки)
-static const bool  DEBUG_RADIO = true;      // ОТЛАДКА: выводить состояние техники в игровое радио
-static const bool  REPAIR_NOTIFY = true;     // радио-сообщение «vehicle repaired»
-static const float GRACE_SECONDS  = 20.0f;   // иммунитет к новой поломке после ремонта
-static const bool  TEST_ALL_BROKEN = false;  // ТЕСТ: каждая новая техника ломается при первом тике
-static const bool  LOG_STATE_CHANGES = true; // лог смены isImmobilized/disabledBecause (найти другие виды поломок)
+static const bool  DEBUG_RADIO = true;          // ОТЛАДКА: выводить состояние техники в игровое радио
+static const bool  REPAIR_NOTIFY = true;        // радио-сообщение «vehicle repaired»
+static const float GRACE_SECONDS  = 20.0f;      // иммунитет к новой поломке после ремонта
+static const bool  TEST_ALL_BROKEN = false;     // ТЕСТ: каждая новая техника ломается при первом тике
+static const bool  LOG_STATE_CHANGES = true;    // лог смены isImmobilized/disabledBecause
 
 // ---- экспортированные функции libmain.so (Itanium mangling) ----
 // Piece/Vehicle: this-указатель в x0, аргументы по ABI AArch64.
@@ -47,6 +62,7 @@ using GetDisabled_t = unsigned char (*)(void* vehicle);
 using SetDisabled_t = void (*)(void* vehicle, unsigned char v);
 using SetBrew_t     = void (*)(void* vehicle, float t);
 struct POSITION { float x, y; };   // по дизассемблеру Piece::getPosition: 2 float (передаётся в s0,s1)
+struct VECTOR   { float x, y, z; };// ПРОВЕРИТЬ: 3 float (HFA в s0..s2)
 using GetPos_t      = POSITION (*)(void* piece);
 using GetU8_t       = unsigned char (*)(void* piece);
 using Radio_t       = void (*)(void* game, const char* msg, unsigned char urgency, unsigned char forSide,
@@ -61,6 +77,14 @@ using Pen_t         = void (*)(void* game, void* v, unsigned char ks, unsigned c
 using Destroy_t     = void (*)(void* game, void* v, unsigned char ks, unsigned char ki, unsigned char method, const char* hitOn);
 using Halt_t        = void (*)(void* piece);
 using Breakdown_t   = unsigned char (*)(void* vehicle, unsigned char gridType, float dt);
+// взрыв
+using GetMass_t     = float (*)(void* vehicle);   // ldr s0,[x0,#0x568]; ret
+using CreateExpl_t  = void (*)(void* game, POSITION pos, unsigned char type, unsigned char visTo, float pounds);
+using EffectExpl_t  = void (*)(void* game, VECTOR at, unsigned char type, const char* sound, float pounds,
+                               bool hitRoof, unsigned char shooterSide, unsigned char shooterI,
+                               unsigned char method, bool makeCrater);
+using Sparks_t      = void (*)(void* game, void* piece);
+using CreateFire_t  = void (*)(void* game, POSITION pos, float smokeSize, unsigned char type, float ttl);
 
 static GetStatus_t   getStatus;
 static IsImmob_t     isImmobilized;
@@ -80,9 +104,16 @@ static Radio_t       orig_radio;      // оригинал sendRadioMessage_..._P
 static void*         g_game;          // Game*, перехватываем из вызовов радио
 static SetBrew_t     setBrewUpTimer;
 static Breakdown_t   orig_breakdown;
+static GetMass_t     getMassKG;
+static CreateExpl_t  createExplosionAt;   // необязательные: могут быть nullptr
+static EffectExpl_t  effectOfExplosionAt;
+static Sparks_t      createSparks;
+static CreateFire_t  createFireAt;
 
 struct State { float repairLeft = -1; float grace = 0; bool seen = false; int lastImm = -1; int lastWhy = -1;
                int fireIdx = -1; float fx = 0, fy = 0;
+               // баки: fuelLeak = идут проверки с растущим шансом; fuelTimer >= 0 = запал горит, ждём взрыв
+               bool fuelLeak = false; float fuelCheckIn = 0; int fuelChecks = 0;
                float fuelTimer = -1; unsigned char fuelKS = 0, fuelKI = 0; };
 static std::unordered_map<void*, State> g_state;
 static std::mutex g_mu;
@@ -184,6 +215,8 @@ static void hook_notpen(void* game, void* piece, bool isTurret, int structure, i
 }
 
 // ---- взрыв баков: хук пробития ----
+// Пробитие двигателя с борта не взрывает сразу, а запускает «протечку»:
+// дальше hook_breakdown бросает кубик с растущим шансом, пока двигатель не починят.
 static void hook_pen(void* game, void* v, unsigned char ks, unsigned char ki, unsigned char method,
                      void* shot, bool turret, bool superstr, bool mantlet, int face, int hl, int fob, float over) {
     g_game = game;
@@ -193,12 +226,37 @@ static void hook_pen(void* game, void* v, unsigned char ks, unsigned char ki, un
     if (getStatus(v) != 0 || !(getDisabledBecause(v) & 8)) return;   // двигатель только что подбит, техника жива
     if (turret) return;
     if (face != FUEL_FACE_LEFT && face != FUEL_FACE_RIGHT) return;
-    if (rand01() >= FUEL_CHANCE) return;
     std::lock_guard<std::mutex> lk(g_mu);
     State& s = g_state[v];
-    s.fuelTimer = FUEL_DELAY_MIN + rand01() * (FUEL_DELAY_MAX - FUEL_DELAY_MIN);
+    if (s.fuelLeak || s.fuelTimer >= 0) return;
+    s.fuelLeak = true;
+    s.fuelChecks = 0;
+    s.fuelCheckIn = FUEL_FIRST_CHECK;
     s.fuelKS = ks; s.fuelKI = ki;
-    LOGI("fuel fire scheduled on %p in %.1fs", v, s.fuelTimer);
+    LOGI("fuel leak started on %p", v);
+}
+
+// ---- сам взрыв: мощность зависит от массы ----
+static void explodeFuel(void* v, State& s) {
+    float kg = getMassKG ? getMassKG(v) : 0.0f;
+    if (!(kg > 0.0f) || kg > 1e6f) kg = 20000.0f;          // защита от мусора
+    float lb = kg * BOOM_LB_PER_KG;
+    if (lb < BOOM_LB_MIN) lb = BOOM_LB_MIN;
+    if (lb > BOOM_LB_MAX) lb = BOOM_LB_MAX;
+
+    POSITION p = getPosition(v);
+    // 1) уничтожение как раньше: экипаж эвакуируется/гибнет по ваниле
+    destroyVehicle(g_game, v, s.fuelKS, s.fuelKI, 40 /* vehicle explosion */, "fuel tank");
+    // 2) визуальный взрыв, размер от массы
+    if (createExplosionAt) createExplosionAt(g_game, p, BOOM_TYPE, 255 /* видят все */, lb);
+    // 3) ударная волна по соседям + звук (воронку не создаём)
+    if (effectOfExplosionAt)
+        effectOfExplosionAt(g_game, VECTOR{p.x, p.y, 0.0f}, BOOM_TYPE, BOOM_SOUND, lb * 0.5f,
+                            false, s.fuelKS, s.fuelKI, 40, false /* без воронки */);
+    // 4) искры и догорающий остов (размер дыма тоже от массы)
+    if (createSparks) createSparks(g_game, v);
+    if (createFireAt) createFireAt(g_game, p, 1.0f + lb / 100.0f, BOOM_FIRE_TYPE, BOOM_FIRE_TTL);
+    LOGI("fuel boom %p mass=%.0fkg lb=%.1f", v, kg, lb);
 }
 
 static unsigned char hook_breakdown(void* v, unsigned char grid, float dt) {
@@ -219,14 +277,28 @@ static unsigned char hook_breakdown(void* v, unsigned char grid, float dt) {
         if (isImmobilized(v) == 0) return 0;   // оригинал не зовём
     }
 
+    // протечка топлива: растущий шанс, пока двигатель не отремонтирован
+    if (s.fuelLeak && getStatus(v) == 0) {
+        s.fuelCheckIn -= dt;
+        if (s.fuelCheckIn <= 0) {
+            float chance = FUEL_CHANCE_START + FUEL_CHANCE_STEP * s.fuelChecks;
+            if (chance > FUEL_CHANCE_MAX) chance = FUEL_CHANCE_MAX;
+            s.fuelChecks++;
+            s.fuelCheckIn = FUEL_CHECK_INTERVAL;
+            if (rand01() < chance) {                  // баки загорелись: запускаем запал
+                s.fuelLeak = false;
+                s.fuelTimer = FUEL_FUSE_MIN + rand01() * (FUEL_FUSE_MAX - FUEL_FUSE_MIN);
+                if (createFireAt) createFireAt(g_game, getPosition(v), 0.8f, BOOM_FIRE_TYPE, s.fuelTimer + 2.0f);
+                LOGI("fuel fuse lit on %p, boom in %.1fs (chance was %.2f)", v, s.fuelTimer, chance);
+            }
+        }
+    }
+
     if (s.fuelTimer >= 0) {                       // баки горят: ждём и взрываем
         s.fuelTimer -= dt;
         if (s.fuelTimer < 0) {
             s.fuelTimer = -1;
-            if (getStatus(v) == 0 && g_game && destroyVehicle) {
-                destroyVehicle(g_game, v, s.fuelKS, s.fuelKI, 40 /* vehicle explosion */, "fuel tank");
-                LOGI("fuel tank exploded %p", v);
-            }
+            if (getStatus(v) == 0 && g_game && destroyVehicle) explodeFuel(v, s);
             g_state.erase(v);
             return 0;
         }
@@ -260,7 +332,11 @@ static unsigned char hook_breakdown(void* v, unsigned char grid, float dt) {
         s.repairLeft -= dt;
         // TODO: проверять, что в экипаже есть живой (Man::getDisability), и что нет боя рядом
         if (s.repairLeft <= 0) {
-            if (why & 8) { setBrewUpTimer(v, 0.0f); extinguishFire(s); }   // отменяем таймер взрыва и тушим огонь
+            if (why & 8) {
+                setBrewUpTimer(v, 0.0f); extinguishFire(s);   // отменяем таймер взрыва и тушим огонь
+                s.fuelLeak = false; s.fuelChecks = 0;         // протечка устранена: шанс взрыва сброшен
+                s.fuelTimer = -1;                             // и запал, если уже горел, тоже отменяется
+            }
             setImmobilized(v, 0);
             setDisabledBecause(v, 0);
             s.repairLeft = -1;
@@ -305,24 +381,10 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM*, void*) {
            && sym(h, "_ZN7Vehicle24hasBecomeDisabledBecauseEh", hasBecomeDisabledBecause)
            && sym(h, "_ZN7Vehicle18getPointerToEngineEv", getPointerToEngine)
            && sym(h, "_ZN6Engine15getSteeringTypeEv", getSteeringType)
+           && sym(h, "_ZN7Vehicle20getMassOfVehicleInKGEv", getMassKG)
            && sym(h, "_ZN4Game66destroyVehicleAndEvacuateCrewmen_KillerSide_KillerI_ByMethod_HitOnEP7VehiclehhhPKc", destroyVehicle);
-    void* penTarget = dlsym(h, "_ZN4Game180vehicleIsPenetrated_KillerSide_KillerI_ByMethod_Shot_IsHitOnTurret_IsHitOnSuperstructure_IsHitOnMantlet_IsHitOnFace_IsHitOnHighOrLow_IsHitOnFrontOrBack_OverPenetrationInMillimetresEP7VehiclehhhP4Shotbbbiiif");
-    void* notPenTarget = dlsym(h, "_ZN4Game95radioThatVehicleIsHitButNotPenetrated_IsTurret_Structure_HighOrLow_Face_Mantlet_ByShot_ByMethodEP5PiecebiiibP4Shoth");
-    void* radioTarget = dlsym(h, "_ZN4Game58sendRadioMessage_Urgency_ForSide_Position_Side_Squad_PieceEPKchh8POSITIONhhh");
-    void* target = dlsym(h, "_ZN7Vehicle50considerIfVehicleBreaksDownOverTerrain_TimeElapsedEhf");
-    if (!ok || !target) { LOGI("init failed"); return JNI_VERSION_1_6; }
-
-    int ir = shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false);
-    LOGI("shadowhook_init = %d", ir);
-    if (STAGE == 2) return JNI_VERSION_1_6;
-    void* stub = shadowhook_hook_func_addr(target, (void*)hook_breakdown, (void**)&orig_breakdown);
-    if (!stub) { LOGI("hook failed, errno=%d", shadowhook_get_errno()); return JNI_VERSION_1_6; }
-    if (radioTarget)
-        shadowhook_hook_func_addr(radioTarget, (void*)hook_radio, (void**)&orig_radio);
-    if (notPenTarget)
-        shadowhook_hook_func_addr(notPenTarget, (void*)hook_notpen, (void**)&orig_notpen);
-    if (penTarget)
-        shadowhook_hook_func_addr(penTarget, (void*)hook_pen, (void**)&orig_pen);
-    LOGI("hook installed, radio=%p notpen=%p pen=%p", radioTarget, notPenTarget, penTarget);
-    return JNI_VERSION_1_6;
-}
+    // необязательные символы для красивого взрыва: если не найдутся, взрыв будет просто ванильный
+    sym(h, "_ZN4Game55createExplosionAt_Type_VisibleOnlyTo_PoundsOfExplosivesE8POSITIONhhf", createExplosionAt);
+    sym(h, "_ZN4Game105effectOfExplosionAt_Type_Sound_PoundsOfExplosives_HitRoof_ShooterSide_ShooterI_DamagedByMethod_MakeCraterE6VECTORhPKcfbhhhb", effectOfExplosionAt);
+    sym(h, "_ZN4Game32createSparksFromExplodingVehicleEP5Piece", createSparks);
+    sym(h, "_ZN4Game38c
