@@ -1,5 +1,5 @@
-// libmod.so - авто-ремонт сломавшегося двигателя, Firefight 13.01 (arm64)
-// НЕ тестировалось. Хуки: ShadowHook (Bytedance).
+// libmod.so - авто-ремонт сломавшегося двигателя, Firefight 13.0.2 (arm64)
+// тестировалось. Хуки: ShadowHook (Bytedance).
 #include <jni.h>
 #include <dlfcn.h>
 #include <android/log.h>
