@@ -23,12 +23,14 @@ static const bool  FUEL_ENABLED = true;
 static const float FUEL_CHANCE = 0.35f;         // шанс взрыва баков при пробитии двигателя с борта
 static const float FUEL_DELAY_MIN = 2.0f;       // задержка до взрыва, секунды
 static const float FUEL_DELAY_MAX = 5.0f;
-static const int   FUEL_FACE = 3;               // 2 = борт (по калибровке)
+static const int   FUEL_FACE_RIGHT = 3;  
+static const int   FUEL_FACE_LEFT = 2;// 2 = борт (по калибровке)
 static const bool  TRACKS_ENABLED = true;
-static const float TRACK_HIT_CHANCE = 0.30f;    // шанс сбить трак при подходящем непробитом попадании
+static const float TRACK_HIT_CHANCE = 0.60f;    // шанс сбить трак при подходящем непробитом попадании
 static const float TRACK_REPAIR_SECONDS = 60.0f;
 static const int   TRACK_HL   = 1;              // какое значение HighOrLow считать «низом»; -1 = любое (калибровка)
-static const int   TRACK_FACE = 3;              // какое значение Face считать «бортом»; -1 = любое (калибровка)
+static const int   TRACK_FACE_RIGHT = 3;              // какое значение Face считать «бортом»; -1 = любое (калибровка)
+static const int   TRACK_FACE_LEFT = 2;
 static const bool  DEBUG_HITS = true;           // радио: параметры каждого непробитого попадания (для калибровки)
 static const bool  DEBUG_RADIO = true;      // ОТЛАДКА: выводить состояние техники в игровое радио
 static const bool  REPAIR_NOTIFY = true;     // радио-сообщение «vehicle repaired»
@@ -170,7 +172,7 @@ static void hook_notpen(void* game, void* piece, bool isTurret, int structure, i
     if (!TRACKS_ENABLED || isTurret || mantlet || !piece) return;
     if (getStatus(piece) != 0 || isImmobilized(piece)) return;
     if (TRACK_HL >= 0 && hl != TRACK_HL) return;
-    if (TRACK_FACE >= 0 && face != TRACK_FACE) return;
+    if (face != TRACK_FACE_LEFT && face != TRACK_FACE_RIGHT) return;
     if (!isTracked(piece)) return;
     if (rand01() >= TRACK_HIT_CHANCE) return;
 
@@ -189,7 +191,8 @@ static void hook_pen(void* game, void* v, unsigned char ks, unsigned char ki, un
     orig_pen(game, v, ks, ki, method, shot, turret, superstr, mantlet, face, hl, fob, over);
     if (!FUEL_ENABLED || !v || before) return;
     if (getStatus(v) != 0 || !(getDisabledBecause(v) & 8)) return;   // двигатель только что подбит, техника жива
-    if (turret || face != FUEL_FACE) return;
+    if (turret) return;
+    if (face != FUEL_FACE_LEFT && face != FUEL_FACE_RIGHT) return;
     if (rand01() >= FUEL_CHANCE) return;
     std::lock_guard<std::mutex> lk(g_mu);
     State& s = g_state[v];
