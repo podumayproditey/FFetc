@@ -17,6 +17,13 @@
 static const float REPAIR_SECONDS = 45.0f;   // время ремонта
 static const float REPAIR_SECONDS_HIT = 90.0f; // ремонт после попадания в двигатель (причина 8)
 static const bool  REPAIR_ENGINE_HIT = true;
+// ---- траки (своя механика: в игре её нет) ----
+static const bool  TRACKS_ENABLED = true;
+static const float TRACK_HIT_CHANCE = 0.30f;    // шанс сбить трак при подходящем непробитом попадании
+static const float TRACK_REPAIR_SECONDS = 60.0f;
+static const int   TRACK_HL   = -1;             // какое значение HighOrLow считать «низом»; -1 = любое (калибровка)
+static const int   TRACK_FACE = -1;             // какое значение Face считать «бортом»; -1 = любое (калибровка)
+static const bool  DEBUG_HITS = true;           // радио: параметры каждого непробитого попадания (для калибровки)
 static const bool  DEBUG_RADIO = true;      // ОТЛАДКА: выводить состояние техники в игровое радио
 static const bool  REPAIR_NOTIFY = true;     // радио-сообщение «vehicle repaired»
 static const float GRACE_SECONDS  = 20.0f;   // иммунитет к новой поломке после ремонта
@@ -36,6 +43,11 @@ using GetPos_t      = POSITION (*)(void* piece);
 using GetU8_t       = unsigned char (*)(void* piece);
 using Radio_t       = void (*)(void* game, const char* msg, unsigned char urgency, unsigned char forSide,
                                POSITION pos, unsigned char side, unsigned char squad, unsigned char piece);
+using HasBecome_t   = void (*)(void* vehicle, unsigned char why);
+using GetPtrEngine_t= void* (*)(void* vehicle);
+using SteerType_t   = unsigned char (*)(void* engine);
+using NotPen_t      = void (*)(void* game, void* piece, bool isTurret, int structure, int highOrLow,
+                               int face, bool mantlet, void* shot, unsigned char method);
 using Halt_t        = void (*)(void* piece);
 using Breakdown_t   = unsigned char (*)(void* vehicle, unsigned char gridType, float dt);
 
@@ -45,6 +57,10 @@ static SetImmob_t    setImmobilized;
 static GetDisabled_t getDisabledBecause;
 static SetDisabled_t setDisabledBecause;
 static Halt_t        haltCurrentOption;
+static HasBecome_t   hasBecomeDisabledBecause;
+static GetPtrEngine_t getPointerToEngine;
+static SteerType_t   getSteeringType;
+static NotPen_t      orig_notpen;
 static GetPos_t      getPosition;
 static GetU8_t       getSide, getSquadI, getI;
 static Radio_t       orig_radio;      // оригинал sendRadioMessage_..._Piece
@@ -120,6 +136,39 @@ static void extinguishFire(State& s) {      // ставим TTL ~0: игра с�
     s.fireIdx = -1;
 }
 
+// ---- траки: перехват «попал, но не пробил» ----
+static uint32_t g_rng = 2463534242u;
+static float rand01() { g_rng ^= g_rng << 13; g_rng ^= g_rng >> 17; g_rng ^= g_rng << 5; return (g_rng & 0xFFFFFF) / 16777216.0f; }
+
+static bool isTracked(void* v) {   // стиринг 0..6 = гусеничные схемы (Clutch&brake ... Twin transmission); 10 = колёса
+    void* e = getPointerToEngine(v);
+    return e && getSteeringType(e) <= 6;
+}
+
+static void hook_notpen(void* game, void* piece, bool isTurret, int structure, int hl, int face,
+                        bool mantlet, void* shot, unsigned char method) {
+    g_game = game;
+    orig_notpen(game, piece, isTurret, structure, hl, face, mantlet, shot, method);
+
+    if (DEBUG_HITS) {
+        char b[96];
+        snprintf(b, sizeof b, "HIT turret=%d struct=%d hl=%d face=%d mant=%d", (int)isTurret, structure, hl, face, (int)mantlet);
+        sendMsg(piece, b);
+    }
+    if (!TRACKS_ENABLED || isTurret || mantlet || !piece) return;
+    if (getStatus(piece) != 0 || isImmobilized(piece)) return;
+    if (TRACK_HL >= 0 && hl != TRACK_HL) return;
+    if (TRACK_FACE >= 0 && face != TRACK_FACE) return;
+    if (!isTracked(piece)) return;
+    if (rand01() >= TRACK_HIT_CHANCE) return;
+
+    hasBecomeDisabledBecause(piece, 2);      // бит 2 = «трак» (в ваниле не используется)
+    char msg[96];
+    snprintf(msg, sizeof msg, "Squad %d: track damaged", (int)getSquadI(piece) + 1);
+    sendMsg(piece, msg);
+    LOGI("track hit on %p", piece);
+}
+
 static unsigned char hook_breakdown(void* v, unsigned char grid, float dt) {
     std::lock_guard<std::mutex> lk(g_mu);
     State& s = g_state[v];
@@ -155,16 +204,18 @@ static unsigned char hook_breakdown(void* v, unsigned char grid, float dt) {
     }
     bool alive  = getStatus(v) == 0;
     int why = getDisabledBecause(v);   // 1 = поломка на местности; 8 = попадание в двигатель / огонь
-    bool broken = isImmobilized(v) != 0 && (why == 1 || (REPAIR_ENGINE_HIT && why == 8));
+    // биты: 1 = поломка на местности, 2 = трак, 8 = двигатель/огонь. Ремонтируем, если других битов нет
+    bool broken = isImmobilized(v) != 0 && why != 0 && (why & ~(1 | 2 | 8)) == 0
+                  && (!(why & 8) || REPAIR_ENGINE_HIT);
     if (alive && broken) {
         if (s.repairLeft < 0) {
-            s.repairLeft = (why == 8) ? REPAIR_SECONDS_HIT : REPAIR_SECONDS;
-            if (why == 8) findFire(v, s);        // запоминаем огонь от попадания
+            s.repairLeft = (why & 8) ? REPAIR_SECONDS_HIT : (why & 2) ? TRACK_REPAIR_SECONDS : REPAIR_SECONDS;
+            if (why & 8) findFire(v, s);        // запоминаем огонь от попадания
         }
         s.repairLeft -= dt;
         // TODO: проверять, что в экипаже есть живой (Man::getDisability), и что нет боя рядом
         if (s.repairLeft <= 0) {
-            if (why == 8) { setBrewUpTimer(v, 0.0f); extinguishFire(s); }   // отменяем таймер взрыва и тушим огонь
+            if (why & 8) { setBrewUpTimer(v, 0.0f); extinguishFire(s); }   // отменяем таймер взрыва и тушим огонь
             setImmobilized(v, 0);
             setDisabledBecause(v, 0);
             s.repairLeft = -1;
@@ -205,7 +256,11 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM*, void*) {
            && sym(h, "_ZN5Piece11getPositionEv", getPosition)
            && sym(h, "_ZN5Piece7getSideEv", getSide)
            && sym(h, "_ZN5Piece9getSquadIEv", getSquadI)
-           && sym(h, "_ZN5Piece4getIEv", getI);
+           && sym(h, "_ZN5Piece4getIEv", getI)
+           && sym(h, "_ZN7Vehicle24hasBecomeDisabledBecauseEh", hasBecomeDisabledBecause)
+           && sym(h, "_ZN7Vehicle18getPointerToEngineEv", getPointerToEngine)
+           && sym(h, "_ZN6Engine15getSteeringTypeEv", getSteeringType);
+    void* notPenTarget = dlsym(h, "_ZN4Game95radioThatVehicleIsHitButNotPenetrated_IsTurret_Structure_HighOrLow_Face_Mantlet_ByShot_ByMethodEP5PiecebiiibP4Shoth");
     void* radioTarget = dlsym(h, "_ZN4Game58sendRadioMessage_Urgency_ForSide_Position_Side_Squad_PieceEPKchh8POSITIONhhh");
     void* target = dlsym(h, "_ZN7Vehicle50considerIfVehicleBreaksDownOverTerrain_TimeElapsedEhf");
     if (!ok || !target) { LOGI("init failed"); return JNI_VERSION_1_6; }
@@ -217,6 +272,8 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM*, void*) {
     if (!stub) { LOGI("hook failed, errno=%d", shadowhook_get_errno()); return JNI_VERSION_1_6; }
     if (radioTarget)
         shadowhook_hook_func_addr(radioTarget, (void*)hook_radio, (void**)&orig_radio);
-    LOGI("hook installed, radio=%p", radioTarget);
+    if (notPenTarget)
+        shadowhook_hook_func_addr(notPenTarget, (void*)hook_notpen, (void**)&orig_notpen);
+    LOGI("hook installed, radio=%p notpen=%p", radioTarget, notPenTarget);
     return JNI_VERSION_1_6;
 }
