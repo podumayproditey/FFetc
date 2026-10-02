@@ -5,6 +5,7 @@
 #include <android/log.h>
 #include <unordered_map>
 #include <vector>
+#include <cmath>
 #include <mutex>
 #include <cstdio>
 #include <cstring>
@@ -37,6 +38,9 @@ static const bool  AMMO_ENABLED         = true;
 // (а) пробитие, после которого техника ЖИВА:
 static const float AMMO_IGNITE_CHANCE   = 0.20f; // шанс запустить горение БК
 static const float AMMO_INSTANT_CHANCE  = 0.06f; // шанс мгновенного подрыва БК
+// (в) пробитие БОКА КОРПУСА (не башни и не зоны двигателя) в технике, где ваниль БК не нашла (БК в корпусе):
+//     с этим шансом считаем, что задет БК, и дальше те же варианты, что в (б)
+static const float AMMO_HULL_CHANCE     = 0.35f;
 // (б) техника УНИЧТОЖЕНА (любым способом) и в ней есть ВВ-боеприпасы — ваниль сама назначила бы взрыв,
 //     теперь решаем мы: сразу / после горения с искрами / вообще без взрыва (остаётся остов)
 static const float AMMO_KILL_INSTANT    = 0.25f; // взрыв сразу
@@ -45,14 +49,18 @@ static const float AMMO_BURN_MIN        = 10.0f; // горит до взрыва
 static const float AMMO_BURN_MAX        = 60.0f; // максимум минута с начала возгорания
 static const float AMMO_SPARK_MIN       = 3.0f;  // редкие искры: интервал между ними (сек)
 static const float AMMO_SPARK_MAX       = 9.0f;
-static const float AMMO_SPARK_LB        = 2.0f;  // «мощность» искры (фунты ВВ, только визуал)
 static const float AMMO_BOOM_MULT       = 1.6f;  // взрыв БК мощнее взрыва баков
 // мощность взрыва от массы (фунты ВВ, линейно, с ограничением)
 static const float BOOM_LB_PER_KG = 0.004f;     // 26 т -> ~104 lb, 60 т -> ~240 lb
 static const float BOOM_LB_MIN    = 8.0f;
 static const float BOOM_LB_MAX    = 400.0f;
 static const float BOOM_FIRE_TTL  = 45.0f;      // сколько горит остов после взрыва
-static const unsigned char BOOM_TYPE = 1;       // КАЛИБРОВАТЬ: тип эффекта взрыва (createExplosionAt)
+// Ванильный взрыв техники (Game::doAServerTick...): effectOfExplosionAt(type=0x11, "explode_tank", 10 lb, method 40)
+// + createSparksFromExplodingVehicle. createExplosionAt в ванили не вызывается вообще — им взрыв не получится.
+static const unsigned char BOOM_TYPE = 0x11;    // тип эффекта «взрыв техники» (из дизассемблера)
+static const float BOOM_Z_OFFSET = 24.375f;     // ваниль берёт высоту земли + это значение
+static const float BOOM_LB_VANILLA = 10.0f;     // ванильная мощность; растёт с массой, но не ниже
+static const float BOOM_LB_CAP     = 40.0f;     // верхний предел (влияет на радиус поражения соседей)
 static const unsigned char BOOM_FIRE_TYPE = 0;  // КАЛИБРОВАТЬ: тип огня (createFireAt)
 static const char* BOOM_SOUND = "explode_tank"; // строка есть в libmain.so
 
@@ -96,6 +104,8 @@ using Halt_t        = void (*)(void* piece);
 using Breakdown_t   = unsigned char (*)(void* vehicle, unsigned char gridType, float dt);
 // взрыв
 using GetMass_t     = float (*)(void* vehicle);   // ldr s0,[x0,#0x568]; ret
+using GroundH_t     = float (*)(void* world, POSITION p);   // World::getHeightOfGroundInPixelsAtPosition
+static GroundH_t     groundHeight;
 using CreateExpl_t  = void (*)(void* game, POSITION pos, unsigned char type, unsigned char visTo, float pounds);
 using EffectExpl_t  = void (*)(void* game, VECTOR at, unsigned char type, const char* sound, float pounds,
                                bool hitRoof, unsigned char shooterSide, unsigned char shooterI,
@@ -120,7 +130,7 @@ static GetPtrEngine_t getPointerToEngine;
 static SteerType_t   getSteeringType;
 static NotPen_t      orig_notpen;
 static GetPos_t      getPosition;
-static GetU8_t       getSide, getSquadI, getI, getKilledBySide, getKilledByI;
+static GetU8_t       getSide, getSquadI, getI, getKilledBySide, getKilledByI, getEngineMounting;
 static Radio_t       orig_radio;      // оригинал sendRadioMessage_..._Piece
 static void*         g_game;          // Game*, перехватываем из вызовов радио
 static SetBrew_t     setBrewUpTimer;
@@ -273,6 +283,10 @@ static void resetRepairOnHit(void* v) {
 
 static void explodeVehicle(void* v, unsigned char ks, unsigned char ki, float lbMult, const char* why);
 
+// Контекст текущего вызова vehicleIsPenetrated (хук destroy срабатывает ВНУТРИ него)
+struct PenCtx { void* v = nullptr; bool hullSideNoEngine = false; };
+static PenCtx g_pen;
+
 // Пробитие: шанс сразу подорвать БК или запустить его горение (один раз на технику)
 static void tryAmmoHit(void* v, unsigned char ks, unsigned char ki) {
     if (!AMMO_ENABLED) return;
@@ -330,7 +344,16 @@ static void hook_pen(void* game, void* v, unsigned char ks, unsigned char ki, un
     int before = wasAlive ? (getDisabledBecause(v) & 8) : 1;
     std::vector<uint8_t> snap;
     if (!before) snap = fireSnapshot();                 // до вызова: какие огни уже горят
+    // Бок корпуса вне секции двигателя: не башня/надстройка/маска, борт, и секция (fob) не совпадает с положением двигателя.
+    // Соответствие из дизассемблера vehicleIsPenetrated: fob 0/1/2 ↔ getEngineMounting 2/1/0
+    g_pen = PenCtx();
+    if (wasAlive && getEngineMounting && !turret && !superstr && !mantlet &&
+        (face == FUEL_FACE_LEFT || face == FUEL_FACE_RIGHT) && fob >= 0 && fob <= 2) {
+        g_pen.v = v;
+        g_pen.hullSideNoEngine = ((int)getEngineMounting(v) != 2 - fob);
+    }
     orig_pen(game, v, ks, ki, method, shot, turret, superstr, mantlet, face, hl, fob, over);
+    g_pen = PenCtx();
     if (!v) return;
     if (wasAlive) resetRepairOnHit(v);                // пробитие тоже сбрасывает ремонт
     if (wasAlive && getStatus(v) == 0) tryAmmoHit(v, ks, ki);   // шанс поджечь / сразу подорвать БК
@@ -355,20 +378,30 @@ static void hook_pen(void* game, void* v, unsigned char ks, unsigned char ki, un
 
 // ---- сам взрыв: мощность зависит от массы ----
 // Только эффекты (взрыв, ударная волна, искры, огонь): для уже уничтоженной техники.
+static float groundZ(POSITION p) {
+    void* world = g_game ? *(void**)((char*)g_game + 0x50) : nullptr;   // Game+0x50 = World* (как в ванили)
+    return (groundHeight && world) ? groundHeight(world, p) : 0.0f;
+}
+
+// Ванильный визуальный взрыв техники в точке p (тот же вызов, что делает серверный тик по таймеру brew up)
+static void vanillaBoom(POSITION p, float lb, unsigned char ks, unsigned char ki) {
+    if (!effectOfExplosionAt) return;
+    effectOfExplosionAt(g_game, VECTOR{p.x, p.y, groundZ(p) + BOOM_Z_OFFSET}, BOOM_TYPE, nullptr /* звук по типу */,
+                        lb, false, ks, ki, 40, false /* без воронки */);
+}
+
 static void boomEffects(void* v, unsigned char ks, unsigned char ki, float lbMult, const char* why) {
     if (!g_game) return;
     float kg = getMassKG ? getMassKG(v) : 0.0f;
     if (!(kg > 0.0f) || kg > 1e6f) kg = 20000.0f;          // защита от мусора
-    float lb = kg * BOOM_LB_PER_KG * lbMult;
-    if (lb < BOOM_LB_MIN) lb = BOOM_LB_MIN;
-    if (lb > BOOM_LB_MAX * lbMult) lb = BOOM_LB_MAX * lbMult;
+    float lb = BOOM_LB_VANILLA * lbMult * sqrtf(kg / 20000.0f);   // 20 т = ваниль, тяжёлые чуть сильнее
+    if (lb < BOOM_LB_VANILLA) lb = BOOM_LB_VANILLA;
+    if (lb > BOOM_LB_CAP * lbMult) lb = BOOM_LB_CAP * lbMult;
     POSITION p = getPosition(v);
-    if (createExplosionAt) createExplosionAt(g_game, p, BOOM_TYPE, 255 /* видят все */, lb);
-    if (effectOfExplosionAt)   // ударная волна по соседям + звук, воронку не создаём
-        effectOfExplosionAt(g_game, VECTOR{p.x, p.y, 0.0f}, BOOM_TYPE, BOOM_SOUND, lb * 0.5f,
-                            false, ks, ki, 40, false);
-    if (createSparks) createSparks(g_game, v);
-    if (createFireAt) createFireAt(g_game, p, 1.0f + lb / 100.0f, BOOM_FIRE_TYPE, BOOM_FIRE_TTL);
+    vanillaBoom(p, lb, ks, ki);                            // сам взрыв + звук + ударная волна по соседям
+    if (createSparks) createSparks(g_game, v);             // ванильные искры от взорвавшейся техники
+    // догорающий остов: createFireAt, тип огня как раньше
+    if (createFireAt) createFireAt(g_game, p, 1.0f + lb / 40.0f, BOOM_FIRE_TYPE, BOOM_FIRE_TTL);
     LOGI("boom (%s) %p mass=%.0fkg lb=%.1f", why, v, kg, lb);
 }
 
@@ -391,7 +424,12 @@ static void hook_destroy(void* game, void* v, unsigned char ks, unsigned char ki
     g_game = game;
     orig_destroy(game, v, ks, ki, method, hitOn);
     if (g_ownDestroy || !AMMO_ENABLED || !v || getStatus(v) == 0) return;
-    if (!(brewTimer(v) > 0.0f)) return;                    // ванильного взрыва нет — не трогаем
+    bool vanillaAmmo = brewTimer(v) > 0.0f;                // ваниль нашла ВВ-боеприпасы в компоненте (башня и т.п.)
+    if (!vanillaAmmo) {
+        // БК в корпусе: ваниль взрыва не назначила. Бок корпуса вне двигателя — шанс, что задет БК
+        if (!(g_pen.v == v && g_pen.hullSideNoEngine) || rand01() >= AMMO_HULL_CHANCE) return;
+        LOGI("ammo: hull side hit on %p, rack hit", v);
+    }
     float r = rand01();
     if (r < AMMO_KILL_INSTANT) {
         brewTimer(v) = 0.0f;
@@ -426,7 +464,7 @@ static unsigned char hook_tickbrew(void* v, float dt) {
         it->second -= dt;
         if (it->second <= 0) {
             it->second = AMMO_SPARK_MIN + rand01() * (AMMO_SPARK_MAX - AMMO_SPARK_MIN);
-            if (createExplosionAt) createExplosionAt(g_game, getPosition(v), BOOM_TYPE, 255, AMMO_SPARK_LB);
+            if (createSparks) createSparks(g_game, v);   // редкие ванильные искры
         }
     }
     return r;
@@ -452,7 +490,7 @@ static unsigned char hook_breakdown(void* v, unsigned char grid, float dt) {
         s.ammoSparkIn -= dt;
         if (s.ammoSparkIn <= 0 && s.ammoTimer > 0) {
             s.ammoSparkIn = AMMO_SPARK_MIN + rand01() * (AMMO_SPARK_MAX - AMMO_SPARK_MIN);
-            if (createExplosionAt) createExplosionAt(g_game, getPosition(v), BOOM_TYPE, 255, AMMO_SPARK_LB);
+            if (createSparks) createSparks(g_game, v);   // редкие ванильные искры
         }
         if (s.ammoTimer <= 0) {
             unsigned char ks = s.ammoKS, ki = s.ammoKI;
@@ -574,6 +612,7 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM*, void*) {
            && sym(h, "_ZN5Piece7getSideEv", getSide)
            && sym(h, "_ZN5Piece9getSquadIEv", getSquadI)
            && sym(h, "_ZN5Piece4getIEv", getI)
+           && sym(h, "_ZN7Vehicle17getEngineMountingEv", getEngineMounting)
            && sym(h, "_ZN5Piece15getKilledBySideEv", getKilledBySide)
            && sym(h, "_ZN5Piece12getKilledByIEv", getKilledByI)
            && sym(h, "_ZN7Vehicle24hasBecomeDisabledBecauseEh", hasBecomeDisabledBecause)
@@ -585,6 +624,7 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM*, void*) {
     sym(h, "_ZN4Game55createExplosionAt_Type_VisibleOnlyTo_PoundsOfExplosivesE8POSITIONhhf", createExplosionAt);
     sym(h, "_ZN4Game105effectOfExplosionAt_Type_Sound_PoundsOfExplosives_HitRoof_ShooterSide_ShooterI_DamagedByMethod_MakeCraterE6VECTORhPKcfbhhhb", effectOfExplosionAt);
     sym(h, "_ZN4Game32createSparksFromExplodingVehicleEP5Piece", createSparks);
+    sym(h, "_ZN5World35getHeightOfGroundInPixelsAtPositionE8POSITION", groundHeight);
     sym(h, "_ZN4Game38createFireAt_SmokeSize_Type_TimeToLiveE8POSITIONfhf", createFireAt);
 
     void* penTarget = dlsym(h, "_ZN4Game180vehicleIsPenetrated_KillerSide_KillerI_ByMethod_Shot_IsHitOnTurret_IsHitOnSuperstructure_IsHitOnMantlet_IsHitOnFace_IsHitOnHighOrLow_IsHitOnFrontOrBack_OverPenetrationInMillimetresEP7VehiclehhhP4Shotbbbiiif");
